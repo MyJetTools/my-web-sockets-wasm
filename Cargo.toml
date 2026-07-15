@@ -1,0 +1,32 @@
+[package]
+name = "my-web-sockets-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Auto-reconnecting browser (WASM) WebSocket client wrapping web_sys::WebSocket, driven by the Dioxus runtime. Exposes incoming frames as a futures::Stream with a reconnect + timeout loop and bounded-channel backpressure."
+repository = "https://github.com/MyJetTools/my-web-sockets-wasm"
+license = "MIT"
+readme = "README.md"
+keywords = ["websocket", "wasm", "dioxus", "browser", "reconnect"]
+categories = ["web-programming::websocket", "wasm"]
+
+# Browser (WASM) WebSocket client — a thin Rust wrapper over the native JS
+# `web_sys::WebSocket`, exposing incoming frames as a `futures::Stream` and a
+# reconnect/timeout loop driven by the Dioxus runtime. Shared by mt-client and
+# mt-admin. NOT reqwest-based (reqwest has no WS in WASM).
+[dependencies]
+dioxus = { version = "0.7" }
+dioxus-utils = { tag = "0.7.0", git = "https://github.com/MyJetTools/dioxus-utils.git", features = [
+    "web",
+] }
+futures = { version = "*" }
+web-sys = { version = "*", features = [
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "BinaryType",
+    "Window",
+    "Performance",
+] }
+wasm-bindgen = { version = "*" }
+js-sys = { version = "*" }
