@@ -73,7 +73,8 @@ stateDiagram-v2
     ReadLoop --> Reconnect: init_timeout (13s, while NotInitialized)
     ReadLoop --> Reconnect: read_timeout (10s no inbound, while Initialized)
     ReadLoop --> Reconnect: on_data() == Err(()) / server close / error
-    Reconnect --> GetUrl: wait reconnect_timeout (3s)
+    Reconnect --> GetUrl: more than 20s since the previous OPEN, immediately
+    Reconnect --> GetUrl: otherwise, wait reconnect_timeout (3s)
 ```
 
 The whole loop lives in one spawned task. You supply behaviour by implementing
@@ -264,15 +265,67 @@ can `send_with_str` / `send_with_u8_array` from anywhere that holds the shared
 
 ## Reconnect & timeout defaults
 
-All four timeouts are **hardcoded** in `WebSocketClient::new()` and are **not
+All five values are **hardcoded** in `WebSocketClient::new()` and are **not
 configurable** in this version:
 
 | Timeout | Default | Meaning |
 |---|---|---|
-| `reconnect_timeout` | 3 s | Wait before each reconnect attempt |
+| `reconnect_timeout` | 3 s | Wait before a reconnect attempt — unless the previous socket was stable (below) |
+| `stable_connection_threshold` | 20 s | More than this since the previous socket reached `OPEN` ⇒ that was a real connection, so the next attempt skips `reconnect_timeout` |
 | `connect_timeout` | 10 s | Max wait for the socket to reach `OPEN` |
 | `init_timeout` | 13 s | Must call `mark_initialized()` within this, or drop |
 | `read_timeout` | 10 s | Max inbound silence after init, or drop |
+
+### Fast reconnect after a stable connection
+
+A socket that dies after a long, healthy session is a different event from one that
+never really worked, and the two deserve different reconnect speeds. The client tells
+them apart with a single measurement: **how long ago the previous socket reached
+`OPEN`**, sampled at the moment the next attempt is decided.
+
+- **More than `stable_connection_threshold` (20 s) ago** — that was a real
+  connection which simply dropped (server restart, network blip). The next attempt
+  runs **immediately**, with no 3 s wait, and logs
+  `WS: previous connection was stable, reconnecting now`.
+- **20 s or less** — the connection was flapping: the server closed it right after
+  accepting, the token was rejected, or `mark_initialized()` was never called and
+  `init_timeout` fired. Those take the normal 3 s backoff, so a rejecting server is
+  not hammered.
+
+Note what the measured interval is, because it is **not** the socket's lifetime: it
+is the lifetime *plus* the time it took to notice the drop, plus however long your
+`on_connected` and `on_disconnected` take. A server that goes silent is only noticed
+`read_timeout` (10 s) later, so a socket that did real work for 11 s and then stalled
+measures ~21 s and counts as stable. That padding is deliberate — it is exactly the
+"between the previous connect and this one" interval — but it does mean the effective
+*working-time* bar is roughly `20 s − detection latency`.
+
+### Why it cannot turn into a hammer
+
+Two properties bound it, and both matter:
+
+1. **The fast path is one-shot.** The credit is spent by every attempt, whatever the
+   outcome. A stable connection buys exactly **one** immediate retry; if that retry
+   does not reach `OPEN`, every attempt after it is back on the 3 s backoff. Without
+   this, a server that stayed down would be retried in a tight loop, each failed
+   attempt still looking at the same hours-old stamp.
+2. **Only an `OPEN` socket mints credit, and it pays out 20 s later.** So two
+   immediate reconnects can never be closer together than `stable_connection_threshold`,
+   no matter what the server does.
+
+Two details follow from "every *attempt* spends the credit":
+
+- An iteration where `get_url()` returns `None` is **not** an attempt. The loop idles
+  there and keeps the credit, so a token being refreshed at the instant the socket
+  dropped does not cost you the fast reconnect — you still connect immediately once a
+  URL appears.
+- A `mark_initialized()` that is never called drops the socket after `init_timeout`
+  (13 s) and normally measures under the 20 s bar, so that cycle stays throttled. If
+  your `on_connected` is slow enough to push the total past 20 s, the cycle earns one
+  immediate retry per round — still bounded by property 2, but fix the missing
+  `mark_initialized()` rather than relying on that.
+
+The very first attempt after `start()` is always immediate, as before.
 
 ---
 

@@ -10,6 +10,11 @@ use super::{WsCallback, WsConnection, WsState};
 
 struct WebSocketClientInner {
     reconnect_timeout: Duration,
+    /// How long a socket must stay `OPEN` for the connection to count as a real,
+    /// working one rather than a flapping attempt. When such a connection drops,
+    /// the next attempt skips [`reconnect_timeout`](WebSocketClientInner::reconnect_timeout)
+    /// and reconnects at once.
+    stable_connection_threshold: Duration,
     connect_timeout: Duration,
     init_timeout: Duration,
     read_timeout: Duration,
@@ -30,12 +35,14 @@ pub struct WebSocketClient {
 }
 
 impl WebSocketClient {
-    /// Create a client with the default timeouts: reconnect 3s, connect 10s,
-    /// init 13s, read 10s.
+    /// Create a client with the default timeouts: reconnect 3s (skipped once after
+    /// a connection that stayed open longer than 20s), connect 10s, init 13s,
+    /// read 10s.
     pub fn new() -> Self {
         Self {
             inner: Rc::new(WebSocketClientInner {
                 reconnect_timeout: Duration::from_secs(3),
+                stable_connection_threshold: Duration::from_secs(20),
                 connect_timeout: Duration::from_secs(10),
                 init_timeout: Duration::from_secs(13),
                 read_timeout: Duration::from_secs(10),
@@ -82,23 +89,81 @@ fn now_ms() -> f64 {
     PERFORMANCE.with(|p| p.as_ref().map(|p| p.now()).unwrap_or(0.0))
 }
 
+/// Whether this connection attempt should skip [`WebSocketClientInner::reconnect_timeout`].
+///
+/// `previous_connected_ms` is the [`now_ms`] stamp of the moment the PREVIOUS socket
+/// reached `OPEN`, or `None` if none ever did or the credit it carries was already spent.
+/// A connection that stayed open longer than `stable_threshold_ms` was a real, working
+/// connection that merely dropped — we want it back as soon as possible. Anything shorter
+/// is flapping (auth reject, init timeout, instant server close) and has to go through the
+/// backoff, or a rejecting server gets hammered.
+///
+/// Two properties keep this from ever turning into a hammer:
+/// - the credit is **one-shot** — every attempt spends it, so a server that stays down is
+///   retried on the plain backoff instead of in a tight loop;
+/// - a fresh credit can only be minted by a socket that actually reached `OPEN`, and only
+///   pays out `stable_threshold_ms` later, so two immediate reconnects are always at least
+///   that far apart.
+fn should_skip_backoff(
+    previous_connected_ms: Option<f64>,
+    now_ms: f64,
+    stable_threshold_ms: f64,
+) -> bool {
+    match previous_connected_ms {
+        Some(connected_ms) => now_ms - connected_ms > stable_threshold_ms,
+        None => false,
+    }
+}
+
 async fn connection_loop<TCallback: WsCallback>(
     inner: Rc<WebSocketClientInner>,
     callback: Rc<TCallback>,
 ) {
     let mut first_iteration = true;
+    // `now_ms()` stamp of the moment the PREVIOUS socket reached `OPEN`, or `None`
+    // if none ever did or the fast-reconnect credit it carries was already spent.
+    // Every iteration of this loop is exactly one connection attempt, and every
+    // attempt spends the credit — see `should_skip_backoff`.
+    let mut last_connected_ms: Option<f64> = None;
+
     while inner.is_working() {
-        if !first_iteration {
+        // Decided before `get_url()`, so the URL is always fetched immediately
+        // before the attempt it belongs to (callers refresh tokens inside it).
+        let skip_backoff = should_skip_backoff(
+            last_connected_ms,
+            now_ms(),
+            inner.stable_connection_threshold.as_millis() as f64,
+        );
+
+        // `skip_backoff` is never true on the first iteration — there is no credit
+        // yet — so the first attempt after `start()` is immediate either way.
+        if !first_iteration && !skip_backoff {
             dioxus_utils::js::sleep(inner.reconnect_timeout).await;
         }
         first_iteration = false;
 
-        let Some(url) = callback.get_url() else {
-            // No URL yet (e.g. not logged in). The loop-top sleep provides the
-            // retry backoff on subsequent iterations, so we just continue.
-            continue;
+        // No URL yet (e.g. not logged in). Idle here rather than burning a loop
+        // iteration on it: a momentary `None` — a token being refreshed at the
+        // instant the socket dropped — must not cost a stable connection its
+        // immediate retry. `get_url` is re-polled after every wait.
+        let url = loop {
+            if let Some(url) = callback.get_url() {
+                break url;
+            }
+            dioxus_utils::js::sleep(inner.reconnect_timeout).await;
+            if !inner.is_working() {
+                return;
+            }
         };
 
+        // We are really attempting now, so spend the credit whatever the outcome:
+        // a server that stays down has to fall back to the plain backoff instead of
+        // being retried in a tight loop.
+        last_connected_ms = None;
+
+        if skip_backoff {
+            dioxus_utils::console_log("WS: previous connection was stable, reconnecting now");
+        }
         dioxus_utils::console_log(format!("Connecting to WS {}", url));
 
         let mut managed = match ManagedWs::open(&url) {
@@ -116,6 +181,11 @@ async fn connection_loop<TCallback: WsCallback>(
             conn.disconnect();
             continue;
         }
+
+        // The socket is OPEN: mint the fast-reconnect credit. If this connection
+        // lasts longer than `stable_connection_threshold`, the next attempt skips
+        // the backoff.
+        last_connected_ms = Some(now_ms());
 
         if callback.on_connected(conn.clone()).await.is_err() {
             conn.disconnect();
@@ -220,5 +290,72 @@ async fn run_read_loop<TCallback: WsCallback>(
                 // wakeup; loop top re-evaluates timeouts
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WebSocketClient, should_skip_backoff};
+    use std::time::Duration;
+
+    /// The default `stable_connection_threshold`, in milliseconds.
+    const STABLE_MS: f64 = 20_000.0;
+
+    #[test]
+    fn defaults_keep_the_flapping_paths_throttled() {
+        let inner = WebSocketClient::new().inner;
+        assert_eq!(
+            inner.stable_connection_threshold,
+            Duration::from_secs(STABLE_MS as u64 / 1_000),
+        );
+        // A socket torn down by `init_timeout` — the caller forgot
+        // `mark_initialized()` — must measure under the threshold, or that cycle
+        // would earn itself a fast retry every single round.
+        assert!(inner.init_timeout < inner.stable_connection_threshold);
+        // Likewise a socket that opened and then went silent straight away.
+        assert!(inner.read_timeout < inner.stable_connection_threshold);
+    }
+
+    #[test]
+    fn no_previous_connection_keeps_the_backoff() {
+        // Nothing ever reached OPEN — connect timeout, open() error, no URL.
+        assert!(!should_skip_backoff(None, 5_000.0, STABLE_MS));
+    }
+
+    #[test]
+    fn short_lived_connection_keeps_the_backoff() {
+        // Opened at 1s, gone by 6s: 5s alive is flapping, not a real session.
+        assert!(!should_skip_backoff(Some(1_000.0), 6_000.0, STABLE_MS));
+    }
+
+    #[test]
+    fn init_timeout_cycle_keeps_the_backoff() {
+        // A caller that forgets `mark_initialized()` drops at ~13s, under the 20s
+        // threshold, so it stays throttled instead of spinning.
+        assert!(!should_skip_backoff(Some(1_000.0), 14_000.0, STABLE_MS));
+    }
+
+    #[test]
+    fn connection_alive_exactly_the_threshold_keeps_the_backoff() {
+        // Strictly greater than, per the spec: 20s exactly is not yet stable.
+        assert!(!should_skip_backoff(Some(1_000.0), 21_000.0, STABLE_MS));
+    }
+
+    #[test]
+    fn connection_alive_past_the_threshold_skips_the_backoff() {
+        assert!(should_skip_backoff(Some(1_000.0), 21_000.1, STABLE_MS));
+    }
+
+    #[test]
+    fn long_lived_connection_skips_the_backoff() {
+        // An hour-long session that just dropped: reconnect immediately.
+        assert!(should_skip_backoff(Some(1_000.0), 3_601_000.0, STABLE_MS));
+    }
+
+    #[test]
+    fn unavailable_performance_clock_keeps_the_backoff() {
+        // `now_ms()` degrades to 0.0 when `performance` is missing, so every
+        // measurement is 0 - 0 = 0 and we fall back to the plain backoff.
+        assert!(!should_skip_backoff(Some(0.0), 0.0, STABLE_MS));
     }
 }
