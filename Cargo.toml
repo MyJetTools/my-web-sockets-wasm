@@ -1,6 +1,6 @@
 [package]
 name = "my-web-sockets-wasm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Auto-reconnecting browser (WASM) WebSocket client wrapping web_sys::WebSocket, driven by the Dioxus runtime. Exposes incoming frames as a futures::Stream with a reconnect + timeout loop and bounded-channel backpressure."

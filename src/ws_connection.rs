@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use super::{WsError, WsState};
 
@@ -9,6 +9,7 @@ pub struct WsConnection {
     ws: web_sys::WebSocket,
     is_connected: Cell<bool>,
     is_initialized: Cell<bool>,
+    disconnect_reason: RefCell<Option<WsError>>,
 }
 
 impl WsConnection {
@@ -17,6 +18,7 @@ impl WsConnection {
             ws,
             is_connected: Cell::new(true),
             is_initialized: Cell::new(false),
+            disconnect_reason: RefCell::new(None),
         }
     }
 
@@ -67,6 +69,27 @@ impl WsConnection {
     /// Mark this connection for teardown. The read loop notices and reconnects.
     pub fn disconnect(&self) {
         self.is_connected.set(false);
+    }
+
+    /// Tears the connection down because the socket itself ended, and keeps what it
+    /// ended with for [`disconnect_reason`](Self::disconnect_reason).
+    pub(super) fn disconnect_because(&self, reason: WsError) {
+        *self.disconnect_reason.borrow_mut() = Some(reason);
+        self.is_connected.set(false);
+    }
+
+    /// What ended this connection, when it was the socket that ended: the close the
+    /// server sent ([`WsError::Closed`] with its code and reason), a transport error
+    /// ([`WsError::ConnectionError`]) or an inbound overflow ([`WsError::SlowConsumer`]).
+    /// Read it in [`on_disconnected`](crate::WsCallback::on_disconnected) to tell, say,
+    /// a `4401 invalid token` from a plain network drop.
+    ///
+    /// `None` while the connection is alive — and when it was this side that tore it
+    /// down: an init or read timeout, an `Err(())` returned by a callback,
+    /// [`disconnect`](Self::disconnect), or
+    /// [`WebSocketClient::stop`](crate::WebSocketClient::stop).
+    pub fn disconnect_reason(&self) -> Option<WsError> {
+        self.disconnect_reason.borrow().clone()
     }
 
     /// Whether the connection is still logically connected (not torn down).

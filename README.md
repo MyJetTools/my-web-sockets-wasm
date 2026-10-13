@@ -49,7 +49,7 @@ reconnecting sockets, this is the reason not to.
 ```toml
 [dependencies]
 my-web-sockets-wasm = { git = "https://github.com/MyJetTools/my-web-sockets-wasm.git" }
-# pin a tag/rev per your org convention, e.g. `, tag = "0.1.0"`
+# pin a tag/rev per your org convention, e.g. `, tag = "0.1.1"`
 ```
 
 ---
@@ -62,7 +62,8 @@ stateDiagram-v2
     GetUrl --> Idle: get_url() == None
     Idle --> GetUrl: wait reconnect_timeout (3s)
     GetUrl --> Connecting: get_url() == Some(url)
-    Connecting --> Reconnect: not OPEN within connect_timeout (10s)
+    Connecting --> Reconnect: refused, or closed before OPEN
+    Connecting --> Reconnect: no OPEN within connect_timeout (10s)
     Connecting --> Connected: socket OPEN
     Connected --> Reconnect: on_connected() == Err(())
     Connected --> ReadLoop: on_connected() == Ok(())
@@ -257,9 +258,32 @@ can `send_with_str` / `send_with_u8_array` from anywhere that holds the shared
 - Internally the read loop turns transport errors, server closes, and a
   slow-consumer overflow into a `WsError` (which implements `Display` /
   `std::error::Error`) and logs it before reconnecting.
-- `on_disconnected` is called for every closed socket, **but** the current
-  disconnect reason (init timeout vs read timeout vs server `Close{code, reason}`
-  vs transport error) is not passed to it — you get the callback, not the cause.
+- `on_disconnected` is called for every closed connection, and **why it closed is
+  on the connection**: `conn.disconnect_reason()` returns the `WsError` the socket
+  ended with — the server's `Closed { code, reason }`, a `ConnectionError`, or a
+  `SlowConsumer` overflow. It is `None` when *this side* tore the connection down:
+  an init or read timeout, an `Err(())` from a callback, `disconnect()` or `stop()`.
+
+  ```rust
+  async fn on_disconnected(&self, conn: Rc<WsConnection>) {
+      if let Some(WsError::Closed { code: 4401, .. }) = conn.disconnect_reason() {
+          // the server refused the token: drop it, so get_url() idles until a new one
+          self.token.borrow_mut().take();
+      }
+  }
+  ```
+- **Frames come before the close.** Whatever the server sent before closing is
+  delivered to `on_data` first and `on_disconnected` comes after — also when the
+  frames and the close arrive in one burst (an error message and a close, a short
+  answer and a close). The one thing that jumps the queue is a slow-consumer
+  overflow (see [Backpressure](#backpressure)).
+- **A socket that opens and is closed right away is still a connection.** The
+  client learns that a socket opened from its `open` event rather than by polling
+  its state, so it cannot miss one — not even in a background tab, where the
+  browser throttles timers. Such a socket gets `on_connected`, the frames it
+  brought, and `on_disconnected`. A socket that is refused or closed *before* it
+  opens gets neither callback, and the log says what happened
+  (`WS: connect failed: …`) instead of calling it a timeout.
 
 ---
 
@@ -342,6 +366,10 @@ feeds: the reconnect runs your `on_connected` resubscribe/resync path (see below
 and the state is rebuilt cleanly. The practical rule: **keep `on_data` fast** and
 offload heavy work with `spawn`; only a persistently slow consumer overflows.
 
+The overflow is reported *ahead of* what is still buffered: those frames, and the
+one that did not fit, are discarded together with the connection. A plain server
+close is the opposite — everything buffered is delivered first.
+
 > Want *drop-oldest* / *drop-newest* instead of disconnect-on-overflow? That's a
 > one-line change in the `on_message` overflow branch in `managed_ws.rs` — but for
 > incremental feeds, disconnect-and-resync is the correct default.
@@ -388,9 +416,10 @@ resets like this one, do your (re)subscription work in `on_connected`.
 | `WsConnection::is_initialized(&self) -> bool` | Whether `mark_initialized()` was called. |
 | `WsConnection::is_connected(&self) -> bool` | Logical connection flag. |
 | `WsConnection::disconnect(&self)` | Flag the connection for teardown. |
+| `WsConnection::disconnect_reason(&self) -> Option<WsError>` | What ended the connection when the socket itself did: `Closed { code, reason }`, `ConnectionError` or `SlowConsumer`. `None` while alive, and when this side tore it down. |
 | `Message` | `Text(String)` \| `Bytes(Vec<u8>)` — delivered to `on_data` (`Debug`, `Clone`). |
 | `WsState` | Socket `readyState`; returned by `state()`. `Debug`/`Copy`/`Eq`. |
-| `WsError` | Error type: returned by the send methods and used internally. `Display` + `std::error::Error`. |
+| `WsError` | Error type: returned by the send methods and by `disconnect_reason()`. `Display` + `std::error::Error`. |
 
 ---
 
@@ -410,9 +439,9 @@ source):
   reconnects on a 10 s cycle.
 - **Timeouts are not configurable.** They are baked into `new()`.
 - **`on_disconnected` pairing is asymmetric** on the connect path: a socket that
-  times out *before* `on_connected` runs does **not** get an `on_disconnected`
-  call, whereas an `on_connected` that returns `Err(())` does. Don't rely on a
-  strict connect/disconnect pairing for resource cleanup.
+  never opens — refused, or timed out — gets no `on_connected` and so **no**
+  `on_disconnected` either, whereas an `on_connected` that returns `Err(())` does
+  get one. Don't rely on a strict connect/disconnect pairing for resource cleanup.
 
 Timeouts are measured with the monotonic `performance.now()` clock, so a system
 clock jump or sleep/resume does **not** cause spurious reconnects.

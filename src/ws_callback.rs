@@ -34,5 +34,10 @@ pub trait WsCallback: 'static {
     async fn on_data(&self, conn: Rc<WsConnection>, msg: Message) -> Result<(), ()>;
 
     /// The connection closed (any reason). Clean up here.
+    ///
+    /// [`WsConnection::disconnect_reason`] tells why, when it was the socket that
+    /// ended — the server's close code and reason, a transport error, an overflow.
+    /// When the server closed the connection, every frame it sent before that has
+    /// been through [`on_data`](Self::on_data) by the time this is called.
     async fn on_disconnected(&self, conn: Rc<WsConnection>);
 }

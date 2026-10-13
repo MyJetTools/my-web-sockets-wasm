@@ -5,8 +5,8 @@ use std::time::Duration;
 use dioxus::prelude::spawn;
 use futures::StreamExt;
 
-use super::managed_ws::ManagedWs;
-use super::{WsCallback, WsConnection, WsState};
+use super::managed_ws::{ConnectError, ManagedWs};
+use super::{WsCallback, WsConnection};
 
 struct WebSocketClientInner {
     reconnect_timeout: Duration,
@@ -176,8 +176,13 @@ async fn connection_loop<TCallback: WsCallback>(
 
         let conn = Rc::new(WsConnection::new(managed.ws_handle()));
 
-        if !wait_for_open(&managed, inner.connect_timeout).await {
-            dioxus_utils::console_log("WS: connect timeout");
+        if let Err(err) = managed.wait_for_open(inner.connect_timeout).await {
+            match err {
+                ConnectError::TimedOut => dioxus_utils::console_log("WS: connect timeout"),
+                // Refused, or closed before it opened — a wrong URL, a server that is
+                // down. Not a timeout, and not logged as one.
+                ConnectError::Failed(_) => dioxus_utils::console_log(format!("WS: {err}")),
+            }
             conn.disconnect();
             continue;
         }
@@ -197,23 +202,6 @@ async fn connection_loop<TCallback: WsCallback>(
 
         callback.on_disconnected(conn).await;
         // managed dropped here → ManagedWs::Drop detaches all listeners and closes WS.
-    }
-}
-
-async fn wait_for_open(managed: &ManagedWs, timeout: Duration) -> bool {
-    let poll = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        match managed.state() {
-            WsState::Open => return true,
-            WsState::Closing | WsState::Closed => return false,
-            WsState::Connecting => {}
-        }
-        if elapsed >= timeout {
-            return false;
-        }
-        dioxus_utils::js::sleep(poll).await;
-        elapsed += poll;
     }
 }
 
@@ -281,7 +269,7 @@ async fn run_read_loop<TCallback: WsCallback>(
                     }
                     Err(err) => {
                         dioxus_utils::console_log(format!("WS disconnected: {err}"));
-                        conn.disconnect();
+                        conn.disconnect_because(err);
                         break;
                     }
                 }
